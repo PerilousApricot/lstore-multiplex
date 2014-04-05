@@ -77,6 +77,7 @@ struct lstore_fd_t {
     int perms;
     mode_t mode;
     int64_t off;
+    int open_time;
 };
 
 typedef struct {
@@ -86,6 +87,7 @@ typedef struct {
     int retry_after_sleep_errors_count;
     int sleep_time;
     int error_timeout;
+    int max_fh_time;
     int migrate_on_open; // percentage * 100
     int migrate_on_fail; // percentage * 100
 } lstore_multiplex_config_t;
@@ -192,6 +194,11 @@ void check_and_update_config() {
     if (fgets(buf, 1023, fh) == NULL) {
         goto cleanup;
     }
+    new_config.max_fh_time = atoi(strip_newline(buf));
+
+    if (fgets(buf, 1023, fh) == NULL) {
+        goto cleanup;
+    }
     new_config.migrate_on_open = atoi(strip_newline(buf));
 
     if (fgets(buf, 1023, fh) == NULL) {
@@ -246,30 +253,23 @@ char * resolve_path(const char *path)
     strcpy(lfs_path + strlen(lfs_root),path);
     strcpy(bfs_path + strlen(bfs_root),path);
 
-    int retval;
+    int retval_lfs, retval_bfs;
     struct stat target;
     short keepGoing = 1;
     errno = 0;
     unsigned int test_time = time(NULL);
     while (keepGoing) {
-        retval = stat(lfs_path, &target);
-        if ((retval == -1) && (errno == ENOENT)) {
-            break;
-        } else if (retval == -1) {
-            keepGoing = should_retry(errno, test_time, NULL);
-        } else if (retval == 0) {
+        retval_lfs = stat(lfs_path, &target);
+        if (retval_lfs == 0) {
             free(bfs_path);
             return lfs_path;
         }
-    }
-    test_time = time(NULL);
-    while (keepGoing) {
-        retval = stat(bfs_path, &target);
-        if ((retval == -1) && (errno == ENOENT)) {
+        retval_bfs = stat(bfs_path, &target);
+        if ((retval_bfs == -1) && (errno == ENOENT)) {
             break;
-        } else if (retval == -1) {
+        } else if (retval_bfs == -1) {
             keepGoing = should_retry(errno, test_time, NULL);
-        } else if (retval == 0) {
+        } else if (retval_bfs == 0) {
             free(lfs_path);
             return bfs_path;
         }
@@ -279,6 +279,33 @@ char * resolve_path(const char *path)
     return strdup(lfs_path);
 }
 
+void possibly_reload(struct fuse_file_info * fi) {
+    struct lstore_fd_t * desc = ((struct lstore_fd_t *)fi->fh);
+    pthread_mutex_lock(&fd_mutex);
+    if (time(NULL) > desc->open_time + lstore_multiplex_config.max_fh_time) { 
+        pthread_mutex_unlock(&fd_mutex);
+        STATSD_COUNT("reopen_file",1);
+        mode_t mode = desc->mode;
+        char * real_path = resolve_path(desc->path);
+        if (!real_path) {
+            return;
+        }
+        int fd;
+        unsigned int test_time = time(NULL);
+        while ((fd = open(real_path, fi->flags, mode)) && (fd == -1) && (should_retry(errno, test_time, NULL)));
+        if (fd == -1) {
+            free(real_path);
+            return;
+        }
+        close(desc->fd);
+        desc->fd = fd;
+        desc->is_lfs = ( strstr(real_path, lfs_root) != NULL );
+        desc->open_time = time(NULL);
+        free(real_path);
+        return;
+    }
+    pthread_mutex_unlock(&fd_mutex);
+}
 void free_fi(struct fuse_file_info * fi) {
     if (fi) {
         struct lstore_fd_t * desc = (struct lstore_fd_t *) fi->fh;
@@ -360,7 +387,7 @@ short should_retry(int my_errno, unsigned int start_time, struct fuse_file_info 
         return 0;
     }   
     snprintf(buf, 1023, "fault_received.%d", my_errno);
-    STATSD_COUNT(buf, 1);
+    STATSD_COUNT(buf,1);
     //fprintf(stderr,"Received error: %d\n", my_errno);
     snprintf(buf2, 1023, "%d", my_errno);
     int i;
@@ -396,30 +423,25 @@ short should_retry(int my_errno, unsigned int start_time, struct fuse_file_info 
                 }
                 unsigned int test_time = time(NULL);
                 while ((fd = open(real_path, fi->flags, mode)) && (fd == -1) && (should_retry(errno, test_time, NULL)));
-                free(real_path);
                 if (fd == -1) {
-                    return 0;
-                }
-                close(desc->fd);
-                desc->fd = fd;
-
-                if (fd < 0) {
-                    errno = my_errno;
-                    //fprintf(stderr,"Error %d passed through after create - nosleep\n", my_errno);
-                    snprintf(buf, 1023, "fault_received.%d", my_errno);
+                    free(real_path);
+                    snprintf(buf, 1023, "reopen_failed.%d", errno);
                     STATSD_COUNT(buf, 1);
                     return 0;
                 }
+                close(desc->fd);
+                desc->is_lfs = ( strstr(real_path, lfs_root) != NULL );
+                free(real_path);
+                desc->fd = fd;
+                desc->open_time = time(NULL);
             }
-            //fprintf(stderr,"Error %d retried - nosleep\n", my_errno);
-            snprintf(buf, 1023, "fault_received.%d", my_errno);
+            snprintf(buf, 1023, "fault_retried.%d", my_errno);
             STATSD_COUNT(buf, 1);
             return 1;
         }
     }
     pthread_mutex_unlock(&fd_mutex);
-    //fprintf(stderr,"Error %d passed through - nomatch\n", my_errno);
-    snprintf(buf, 1023, "fault_received.%d", my_errno);
+    snprintf(buf, 1023, "fault_ignored.%d", my_errno);
     STATSD_COUNT(buf, 1);
     return 0;
 }
@@ -632,12 +654,13 @@ int xmp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
         return -ENOMEM;
     }
     desc->fd = fd;
+    desc->open_time = time(NULL);
     ////fprintf(stderr, "Opening %d\n", fd);
     desc->path = strdup(path);
     desc->real_path = real_path;
     desc->flags = fi->flags;
     desc->mode = mode;
-    desc->is_lfs = ( strstr(path, lfs_root) != NULL );
+    desc->is_lfs = ( strstr(real_path, lfs_root) != NULL );
     // keep a linked list around .. just in case
     pthread_mutex_lock(&fd_mutex);
     desc->next = fd_head;
@@ -659,19 +682,13 @@ int xmp_read(const char *path, char *buf, size_t size, off_t offset,
     int res;
 
     (void) path;
-    int fd = (((struct lstore_fd_t *)fi->fh)->fd);
     STATSD_TIMER_START(read_loop_timer);
     int trace = 0;
-    if (((offset == 0) && (size != 32768)) ||
-        ((offset == 32768) && (size != 65536)) ||
-        ((offset > 32768) && (offset < 2981888) && (size != 131072)) ||
-         ((offset == 2981888) && (size != 45056))) {
-        // //fprintf(stderr, "FATAL1: Read %d from %d\n", size, offset);
-    }
-    
     unsigned int test_time = time(NULL);
     while (1) {
         // //fprintf(stderr, "read %d %d %d %ld %ld\n", fd, size, offset, fi, fi->fh);
+        possibly_reload(fi);
+        int fd = (((struct lstore_fd_t *)fi->fh)->fd);
         res = pread(fd, buf, size, offset);
         if (res != -1) {
             break;
@@ -680,19 +697,9 @@ int xmp_read(const char *path, char *buf, size_t size, off_t offset,
         }
         // gonna retry
         // //fprintf(stderr, "Old fd %d %d %d\n", fd, (int64_t) ((struct lstore_fd_t *)fi->fh), errno); 
-        fd = (((struct lstore_fd_t *)fi->fh)->fd);
         // //fprintf(stderr, " newfd %d %d %d\n", fd, (int64_t) ((struct lstore_fd_t *)fi->fh), errno);
         trace = 1;
         errno = 0;
-    }
-    if (trace == 1) {
-        // //fprintf(stderr, "POST - %d %d %d\n", fd, size, res);
-    }
-    if (((offset == 0) && (res != 32768)) ||
-        ((offset == 32768) && (res != 65536)) ||
-        ((offset > 32768) && (offset < 2981888) && (res != 131072)) ||
-         ((offset == 2981888) && (res != 43161))) {
-        // //fprintf(stderr, "FATAL2: Read %d from %d\n", res, offset);
     }
     if (res == -1) {
         res = -errno;
@@ -708,9 +715,6 @@ int xmp_read(const char *path, char *buf, size_t size, off_t offset,
     } else {
         STATSD_TIMER_END("posix_read_time", read_loop_timer);
         STATSD_COUNT("posix_bytes_read", res);
-    }
-    if ((res != size) && (res != 43161)) {
-        // //fprintf(stderr, "FATAL: read short %d %u\n", size, res);
     }
 
     return res;
@@ -795,8 +799,6 @@ int xmp_release(const char *path, struct fuse_file_info *fi)
         if (desc->real_path) {
             free(desc->real_path);
         }
-
-        ////fprintf(stderr,"FREE - DESC2 %lu\n", (int64_t) desc);
         free(desc);
     }
     return 0;
@@ -854,15 +856,17 @@ int main(int argc, char *argv[])
     xmp_oper.release	= xmp_release;
 
     // initialize config
-    lstore_multiplex_config.retry_errors = malloc(sizeof(char *) * 2);
+    lstore_multiplex_config.retry_errors = malloc(sizeof(char *) * 3);
     lstore_multiplex_config.retry_errors[0] = strdup("4");
     lstore_multiplex_config.retry_errors[1] = strdup("11");
-    lstore_multiplex_config.retry_errors_count = 2;
+    lstore_multiplex_config.retry_errors[2] = strdup("5");
+    lstore_multiplex_config.retry_errors_count = 3;
     lstore_multiplex_config.retry_after_sleep_errors = malloc(sizeof(char *) * 1);
     lstore_multiplex_config.retry_after_sleep_errors[0] = strdup("107");
     lstore_multiplex_config.retry_after_sleep_errors[1] = strdup("103");
     lstore_multiplex_config.retry_after_sleep_errors_count = 2;
     lstore_multiplex_config.sleep_time = 15;
+    lstore_multiplex_config.max_fh_time = 60 * 30;
     lstore_multiplex_config.error_timeout = 660;
     lstore_multiplex_config.migrate_on_fail = 0;
     lstore_multiplex_config.migrate_on_open = 0;
