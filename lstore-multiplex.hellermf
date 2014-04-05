@@ -1,0 +1,89 @@
+#!/bin/bash
+#!/bin/sh
+#
+# lstore-multiplex Mount to gloss over BFS problems
+#
+# chkconfig:   <default runlevel(s)> <start> <stop>
+# description: Mount to gloss over BFS problems
+
+### BEGIN INIT INFO
+# Provides: 
+# Required-Start: 
+# Required-Stop: 
+# Should-Start: 
+# Should-Stop: 
+# Default-Start: 
+# Default-Stop: 
+# Short-Description: 
+# Description:      
+### END INIT INFO
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+BINARY_ROOT=/scratch/meloam/lstore-multiplex
+MOUNT_POINT=/lstore-multiplex/
+
+exec="${BINARY_ROOT}/fuse_multiplex"
+prog="lstore-multiplex"
+
+lockfile=/var/lock/subsys/$prog
+
+start() {
+    [ -x $exec ] || exit 5
+    echo -n $"Starting $prog: "
+    set -x
+# some of the cluster nodes have a version of libfuse that does not support the 'large_read' option
+#    $exec -o allow_other,large_read,intr ${MOUNT_POINT}
+    $exec -o allow_other,intr ${MOUNT_POINT}
+    retval=$?
+    set +x
+    echo
+    [ $retval -eq 0 ] && touch $lockfile
+    return $retval
+}
+
+stop() {
+    echo -n $"Stopping $prog: "
+    fusermount -uz ${MOUNT_POINT}
+    retval=$?
+    echo
+    [ $retval -eq 0 ] && rm -f $lockfile
+    return $retval
+}
+
+restart() {
+    stop
+    start
+}
+
+rh_status() {
+    # run checks to determine if the service is running or use generic status
+    stat ${MOUNT_POINT}/ONLYATVANDY.txt
+}
+
+rh_status_q() {
+    rh_status >/dev/null 2>&1
+}
+
+
+case "$1" in
+    start)
+        rh_status_q && exit 0
+        $1
+        ;;
+    stop)
+        rh_status_q || exit 0
+        $1
+        ;;
+    restart)
+        $1
+        ;;
+    status)
+        rh_status
+        ;;
+    *)
+        echo $"Usage: $0 {start|stop|status|restart}"
+        exit 2
+esac
+exit $?
